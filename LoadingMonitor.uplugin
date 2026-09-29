@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "Version": 102,
+  "VersionName": "1.0.3",
+  "FriendlyName": "Loading Monitor",
+  "Description": "UE 5 loading monitor: thread-safe loading log capture with Slate/MoviePlayer overlay.",
+  "Category": "Loading",
+  "CreatedBy": "OG Team",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "LoadingMonitor",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
