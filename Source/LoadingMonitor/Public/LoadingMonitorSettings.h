@@ -96,15 +96,8 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "General")
 	TArray<FString> AllowedLevelNames;
 
-	/**
-	 * Keeps the loading screen up for at least this many seconds after the level actually finishes
-	 * loading, instead of it vanishing the instant loading completes (which can look like a flash if
-	 * the load happened to be fast). The progress bar finishes climbing to 100% right as loading
-	 * completes (see ProgressBarSmoothingSpeed) rather than jumping straight to the level opening -
-	 * this is the window that finish is actually visible in, so 0 means you likely won't see it at
-	 * all. Has no effect when Use Custom Widget is on - a custom widget isn't run through this timing
-	 * system at all.
-	 */
+	/** Minimum TOTAL screen time, measured from playback start. Completion animation/hold below
+	 * are also honored after the map is ready. Has no effect for a custom UMG widget. */
 	UPROPERTY(config, EditAnywhere, Category = "General", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "5.0", EditCondition = "!bUseCustomWidget"))
 	float MinimumDisplayTimeSeconds = 0.6f;
 
@@ -279,15 +272,25 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Progress Bar", meta = (EditCondition = "!bUseCustomWidget"))
 	bool bShowPercentageText = true;
 
-	/**
-	 * The real underlying data (how many assets are still compiling) arrives in chunks, not a smooth
-	 * stream - without this, the bar visibly jumps whenever a batch finishes. This is how quickly the
-	 * displayed value eases toward the real one instead of snapping to it. Higher = snappier/more
-	 * responsive, lower = smoother/more gradual. This only smooths what's *displayed* - the underlying
-	 * progress calculation and the percentage text are unaffected.
-	 */
+	/** Response of the critically damped smoothing. Higher catches up faster. Bar and text use the same displayed value. */
 	UPROPERTY(config, EditAnywhere, Category = "Progress Bar", meta = (ClampMin = "0.5", ClampMax = "20.0", EditCondition = "!bUseCustomWidget"))
 	float ProgressBarSmoothingSpeed = 4.0f;
+
+	/** Maximum percentage points traveled per second during loading; prevents large compile batches from jumping. */
+	UPROPERTY(config, EditAnywhere, Category = "Progress Bar", meta = (ClampMin = "5.0", ClampMax = "100.0", EditCondition = "!bUseCustomWidget"))
+	float ProgressBarMaxSpeed = 35.0f;
+
+	/** Smooth finish to 100% after map readiness. This duration is independent of normal smoothing. 0 disables the finish animation. */
+	UPROPERTY(config, EditAnywhere, Category = "Progress Bar", meta = (ClampMin = "0.0", ClampMax = "3.0", Units = "s", EditCondition = "!bUseCustomWidget"))
+	float CompletionAnimationDurationSeconds = 0.45f;
+
+	/** Keeps the finished bar visible briefly before dismissing the screen. */
+	UPROPERTY(config, EditAnywhere, Category = "Progress Bar", meta = (ClampMin = "0.0", ClampMax = "3.0", Units = "s", EditCondition = "!bUseCustomWidget"))
+	float CompletionHoldSeconds = 0.15f;
+
+	/** Subtle traveling highlight within the measured fill while loading. The track stays empty until progress can be measured. Turn off for reduced bar motion. */
+	UPROPERTY(config, EditAnywhere, Category = "Progress Bar", meta = (EditCondition = "!bUseCustomWidget"))
+	bool bAnimateProgressActivity = true;
 
 	/** Once the (smoothed) percentage crosses this, Message_AlmostThere replaces whatever status line was showing - fires once per load. */
 	UPROPERTY(config, EditAnywhere, Category = "Progress Bar", meta = (ClampMin = "50.0", ClampMax = "99.0", EditCondition = "!bUseCustomWidget"))

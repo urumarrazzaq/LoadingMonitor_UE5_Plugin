@@ -14,6 +14,9 @@
 #include "AssetCompilingManager.h"
 #include "LoadingMonitorSettings.h"
 #include "LoadingMonitorPreview.h"
+#include "LoadingMonitorProgress.h"
+#include "Rendering/DrawElements.h"
+#include "Widgets/SLeafWidget.h"
 #include "Engine/Engine.h"
 #include "Engine/Texture2D.h"
 #include "UObject/StrongObjectPtr.h"
@@ -31,7 +34,6 @@
 #include "Widgets/Images/SThrobber.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
-#include "Widgets/Notifications/SProgressBar.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/SNullWidget.h"
@@ -86,12 +88,7 @@ namespace LoadingMonitor
                 : FString::Printf(TEXT("%s: %s"), *LoadingMapLabel, *ShortName));
             TrimLines();
 
-            TotalCompleted = 0;
-            Percent = 0.0f;
-            bHasProgress = false;
-            bCompleted = false;
-            DisplayedPercent = 0.0f;
-            LastDisplayUpdateTime = 0.0;
+            Progress.Reset();
             bAnnouncedAlmostThere = false;
         }
 
@@ -159,131 +156,68 @@ namespace LoadingMonitor
         FString GetText() const
         {
             FScopeLock ScopeLock(&Mutex);
+            const EStatusCategory Override = Progress.IsComplete()
+                ? EStatusCategory::FinishingWorldSetup : EStatusCategory::AlmostThere;
+            if (Progress.IsComplete() || bAnnouncedAlmostThere)
+            {
+                const FString Label = GetLabel_NoLock(Override);
+                if (!Label.IsEmpty()) return Label;
+            }
             return FString::Join(Lines, TEXT("\n"));
         }
 
-        /**
-         * Called from HandleAssetPostCompile (a thread-safe engine delegate - see the module below)
-         * whenever a batch of assets finishes compiling - or, in the preview window, from a simulated
-         * feed on a normal game-thread ticker. CurrentRemaining is the total in-flight right now
-         * across every asset type combined (textures, static meshes, HLODs, ...); NumJustCompleted is
-         * how many finished since the last call (0 for a baseline seed call).
-         *
-         * Percent is cumulative-completed / cumulative-ever-queued, and - deliberately - can only ever
-         * go up. The raw ratio genuinely can dip when a new phase (HLODs right as static meshes
-         * finish, say) adds a lot of new work relative to what's completed so far; a progress bar that
-         * visibly moves backward reads as broken no matter how "honest" the number is, the same way a
-         * real download/install bar never does either. So the displayed Percent is clamped to its own
-         * highest value so far: a big new phase pauses the climb until enough of it completes to
-         * organically pass the previous high point, it never steps backward to show it.
-         *
-         * No-ops once ForceComplete() has been called (see there for why).
-         */
         void UpdateProgress(int32 CurrentRemaining, int32 NumJustCompleted = 0)
         {
-            bool bShouldAnnounceAlmostThere = false;
-
-            {
-                FScopeLock ScopeLock(&Mutex);
-
-                if (bCompleted)
-                {
-                    return;
-                }
-
-                TotalCompleted += FMath::Max(0, NumJustCompleted);
-                const int32 TotalEverQueued = TotalCompleted + FMath::Max(0, CurrentRemaining);
-
-                if (TotalEverQueued > 0)
-                {
-                    const float RawPercent = 100.0f * (static_cast<float>(TotalCompleted) / static_cast<float>(TotalEverQueued));
-                    Percent = FMath::Max(Percent, RawPercent);
-                    bHasProgress = true;
-                }
-
-                if (!bAnnouncedAlmostThere && bHasProgress && Percent >= AlmostThereThresholdPercent)
-                {
-                    bAnnouncedAlmostThere = true;
-                    bShouldAnnounceAlmostThere = true;
-                }
-            }
-
-            // Outside the lock above - PushCategory() takes its own lock (see Push()).
-            if (bShouldAnnounceAlmostThere)
-            {
-                PushCategory(EStatusCategory::AlmostThere);
-            }
+            FScopeLock ScopeLock(&Mutex);
+            Progress.Update(CurrentRemaining, NumJustCompleted);
         }
 
-        /**
-         * Called once loading has genuinely finished (HandlePostLoadMap), before the level actually
-         * opens. The asset-compiling signal this is built on only ever covers part of a real load
-         * (actor spawning, BeginPlay, GC, etc all happen too), so Percent reaching exactly 100% right
-         * as the level becomes ready is the exception, not the rule - without this, the bar would jump
-         * straight from wherever it happened to be (68%, 91%, whatever) to the level just opening.
-         * This snaps the target to 100 and locks out any further real updates, so the existing
-         * smoothing (ProgressBarSmoothingSpeed) visibly eases the displayed value the rest of the way
-         * to 100% instead - a deliberate finishing flourish, not a jump cut. Pair with
-         * MinimumDisplayTimeSeconds so there's actually time left on screen for it to be seen.
-         */
         void ForceComplete()
         {
             FScopeLock ScopeLock(&Mutex);
-            bCompleted = true;
-            Percent = 100.0f;
-            bHasProgress = true;
+            Progress.Complete();
         }
 
-        /** How quickly the displayed value eases toward the real one - see ULoadingMonitorSettings::ProgressBarSmoothingSpeed. */
-        void SetSmoothingSpeed(float InSpeed)
+        void ConfigureProgress(float Speed, float MaxSpeed, float CompletionDuration)
         {
             FScopeLock ScopeLock(&Mutex);
-            SmoothingSpeed = FMath::Max(0.1f, InSpeed);
+            Progress.Configure(Speed, MaxSpeed, CompletionDuration);
         }
 
-        /**
-         * The real underlying signal (remaining asset-compile count) arrives in discrete jumps
-         * whenever a batch finishes, not a smooth stream - returning Percent directly would make the
-         * bar visibly snap each time. This eases the *displayed* value toward Percent over time
-         * instead, using the real elapsed time between calls, so it animates smoothly no matter how
-         * often (or rarely) the widget asks - which, again, can be from any thread.
-         */
+        // Exactly one update per widget tick. Attribute reads never advance the animation.
+        void TickDisplay(float DeltaSeconds)
+        {
+            FScopeLock ScopeLock(&Mutex);
+            Progress.Tick(DeltaSeconds);
+            if (!bAnnouncedAlmostThere && !Progress.IsComplete()
+                && Progress.HasProgress() && Progress.GetPercent() >= AlmostThereThresholdPercent)
+            {
+                bAnnouncedAlmostThere = true;
+            }
+        }
+
         float GetPercent() const
         {
             FScopeLock ScopeLock(&Mutex);
-
-            const double Now = FPlatformTime::Seconds();
-
-            if (LastDisplayUpdateTime <= 0.0)
-            {
-                LastDisplayUpdateTime = Now;
-                DisplayedPercent = Percent;
-                return DisplayedPercent;
-            }
-
-            const float DeltaTime = static_cast<float>(FMath::Clamp(Now - LastDisplayUpdateTime, 0.0, 0.5));
-            LastDisplayUpdateTime = Now;
-
-            if (DeltaTime > 0.0f)
-            {
-                const float Alpha = 1.0f - FMath::Exp(-SmoothingSpeed * DeltaTime);
-                DisplayedPercent = FMath::Lerp(DisplayedPercent, Percent, Alpha);
-
-                // Snap once close enough - an exponential ease never quite reaches its target.
-                if (FMath::Abs(DisplayedPercent - Percent) < 0.1f)
-                {
-                    DisplayedPercent = Percent;
-                }
-            }
-
-            return DisplayedPercent;
+            return Progress.GetPercent();
         }
 
-        /** False until the first progress sample comes in - lets the widget show an indeterminate state instead of a misleading "0%" before any work has actually been measured. */
         bool HasProgress() const
         {
             FScopeLock ScopeLock(&Mutex);
-            return bHasProgress;
+            return Progress.HasProgress();
+        }
+
+        bool IsComplete() const
+        {
+            FScopeLock ScopeLock(&Mutex);
+            return Progress.IsComplete();
+        }
+
+        bool IsPresentationComplete() const
+        {
+            FScopeLock ScopeLock(&Mutex);
+            return Progress.IsSettled();
         }
 
     private:
@@ -333,13 +267,7 @@ namespace LoadingMonitor
         TArray<FString> Labels;
         int32 MaxVisibleLines = DefaultMaxVisibleLines;
 
-        int32 TotalCompleted = 0;
-        float Percent = 0.0f;
-        bool bHasProgress = false;
-        bool bCompleted = false;
-        float SmoothingSpeed = 4.0f;
-        mutable float DisplayedPercent = 0.0f;
-        mutable double LastDisplayUpdateTime = 0.0;
+        FProgressPresentation Progress;
         float AlmostThereThresholdPercent = 90.0f;
         bool bAnnouncedAlmostThere = false;
         bool bShowAssetDetail = false;
@@ -547,6 +475,9 @@ namespace LoadingMonitor
         bool bShowProgressBar = true;
         bool bShowPercentageText = true;
         float ProgressBarSmoothingSpeed = 4.0f;
+        float ProgressBarMaxSpeed = 35.0f;
+        float CompletionAnimationDurationSeconds = 0.45f;
+        bool bAnimateProgressActivity = true;
         float AlmostThereThresholdPercent = 90.0f;
         FLinearColor ProgressBarFillColor = FLinearColor(0.231373f, 0.556863f, 0.964706f, 1.0f);
         FLinearColor ProgressBarBackgroundColor = FLinearColor(1.0f, 1.0f, 1.0f, 0.08f);
@@ -587,6 +518,89 @@ namespace LoadingMonitor
         TArray<FString> MessageLabels;
     };
 
+    // Paint-only fill geometry avoids layout churn and integer-pixel stepping at slow speeds.
+    class SLoadingProgressBar final : public SLeafWidget
+    {
+    public:
+        SLATE_BEGIN_ARGS(SLoadingProgressBar) {}
+            SLATE_ARGUMENT(FLoadingStateWeakPtr, LoadingState)
+            SLATE_ARGUMENT(FLinearColor, FillColor)
+            SLATE_ARGUMENT(FLinearColor, TrackColor)
+            SLATE_ARGUMENT(float, Height)
+            SLATE_ARGUMENT(float, CornerRadius)
+            SLATE_ARGUMENT(bool, AnimateActivity)
+        SLATE_END_ARGS()
+
+        void Construct(const FArguments& InArgs)
+        {
+            State = InArgs._LoadingState;
+            Height = InArgs._Height;
+            Radius = FMath::Clamp(InArgs._CornerRadius, 0.0f, Height * 0.5f);
+            bAnimateActivity = InArgs._AnimateActivity;
+            FillColor = InArgs._FillColor;
+            TrackColor = InArgs._TrackColor;
+            StartTime = FPlatformTime::Seconds();
+            SetCanTick(false);
+        }
+
+        virtual FVector2D ComputeDesiredSize(float) const override { return FVector2D(100.0f, Height); }
+        virtual bool ComputeVolatility() const override { return true; }
+
+        virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& Geometry,
+            const FSlateRect& CullingRect, FSlateWindowElementList& Elements, int32 Layer,
+            const FWidgetStyle& Style, bool bParentEnabled) const override
+        {
+            const FVector2D Size = Geometry.GetLocalSize();
+            if (Size.X <= 0.0f || Size.Y <= 0.0f) return Layer;
+            const FLoadingStatePtr Pinned = State.Pin();
+            const bool bMeasured = Pinned.IsValid() && Pinned->HasProgress();
+            const bool bComplete = Pinned.IsValid() && Pinned->IsComplete();
+            const float Percent = Pinned.IsValid() ? Pinned->GetPercent() / 100.0f : 0.0f;
+            const float Phase = static_cast<float>(FMath::Fmod(FPlatformTime::Seconds() - StartTime, 1.8) / 1.8);
+            const ESlateDrawEffect Effects = ESlateDrawEffect::NoPixelSnapping
+                | (ShouldBeEnabled(bParentEnabled) ? ESlateDrawEffect::None : ESlateDrawEffect::DisabledEffect);
+
+            const auto Draw = [&](float X, float Width, float Y, float H, FLinearColor Color, int32 DrawLayer)
+            {
+                if (Width <= 0.0f || H <= 0.0f) return;
+                const FSlateRoundedBoxBrush Brush(FLinearColor::White,
+                    FMath::Min(Radius, FMath::Min(Width, H) * 0.5f));
+                FSlateDrawElement::MakeBox(Elements, DrawLayer,
+                    Geometry.ToPaintGeometry(FVector2D(Width, H), FSlateLayoutTransform(FVector2D(X, Y))),
+                    &Brush, Effects, Color * Style.GetColorAndOpacityTint());
+            };
+
+            Draw(0.0f, Size.X, 0.0f, Size.Y, TrackColor, Layer);
+            // With no measurement, leave the track empty. The separate throbber provides activity
+            // feedback; no bouncing segment or invented fill is shown in the progress bar.
+            if (bMeasured)
+            {
+                const float FilledWidth = Size.X * FMath::Clamp(Percent, 0.0f, 1.0f);
+                Draw(0.0f, FilledWidth, 0.0f, Size.Y, FillColor, Layer + 1);
+                // Activity is independent of measured progress, so a quiet compile still looks alive.
+                if (bAnimateActivity && !bComplete && FilledWidth > Size.Y * 2.0f)
+                {
+                    const float HighlightWidth = FMath::Min(FilledWidth * 0.25f, 120.0f);
+                    const float Left = -HighlightWidth + Phase * (FilledWidth + HighlightWidth);
+                    const float Begin = FMath::Max(Size.Y * 0.5f, Left);
+                    const float End = FMath::Min(FilledWidth - Size.Y * 0.5f, Left + HighlightWidth);
+                    Draw(Begin, End - Begin, Size.Y * 0.3f, Size.Y * 0.4f,
+                        FLinearColor(1.0f, 1.0f, 1.0f, 0.22f * FillColor.A), Layer + 2);
+                }
+            }
+            return Layer + 2;
+        }
+
+    private:
+        FLoadingStateWeakPtr State;
+        FLinearColor FillColor;
+        FLinearColor TrackColor;
+        float Height = 8.0f;
+        float Radius = 4.0f;
+        bool bAnimateActivity = true;
+        double StartTime = 0.0;
+    };
+
     class SLoadingMonitorWidget final : public SCompoundWidget
     {
     public:
@@ -607,6 +621,7 @@ namespace LoadingMonitor
             StartTime = FPlatformTime::Seconds();
             BuildShuffledOrder();
             BuildBrushes();
+            RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateSP(this, &SLoadingMonitorWidget::KeepAnimating));
 
             TSharedRef<SWidget> TitleWidget = BuildTitleWidget();
 
@@ -632,8 +647,8 @@ namespace LoadingMonitor
                     .BorderBackgroundColor(FLinearColor(0.008f, 0.012f, 0.022f, 1.0f))
                 ]
 
-                // Crossfading background: outgoing image fades out underneath while the incoming one
-                // fades in on top - both computed purely from wall-clock time (see ComputeBackgroundFadeCycle),
+                // Keep the outgoing image opaque while the incoming image fades over it. Fading both
+                // darkens the midpoint of every transition. Computed from wall-clock time (see ComputeBackgroundFadeCycle),
                 // so it animates smoothly on MoviePlayer's Slate thread with no Tick() override needed.
                 + SOverlay::Slot()
                 [
@@ -645,8 +660,7 @@ namespace LoadingMonitor
                     })
                     .ColorAndOpacity_Lambda([this]() -> FSlateColor
                     {
-                        const FFadeCycleState Fade = ComputeBackgroundFadeCycle();
-                        return FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 1.0f - Fade.FadeAlpha));
+                        return FSlateColor(FLinearColor::White);
                     })
                 ]
 
@@ -695,12 +709,22 @@ namespace LoadingMonitor
             ];
         }
 
+        virtual void Tick(const FGeometry& AllottedGeometry, double CurrentTime, float DeltaTime) override
+        {
+            SCompoundWidget::Tick(AllottedGeometry, CurrentTime, DeltaTime);
+            if (LoadingState.IsValid()) LoadingState->TickDisplay(DeltaTime);
+        }
+
     private:
+        EActiveTimerReturnType KeepAnimating(double, float)
+        {
+            return EActiveTimerReturnType::Continue;
+        }
+
         void BuildBrushes()
         {
             const bool bFullWidth = Config.PanelLayoutMode == ELoadingPanelLayoutMode::FullWidthBottomBar;
             const float PanelRadius = bFullWidth ? 0.0f : Config.PanelCornerRadius;
-            const float ProgressRadius = bFullWidth ? 0.0f : Config.ProgressBarCornerRadius;
 
             PanelBrush = MakeShared<FSlateRoundedBoxBrush>(
                 Config.PanelBackgroundColor, PanelRadius,
@@ -709,11 +733,7 @@ namespace LoadingMonitor
             PanelShadowBrush = MakeShared<FSlateRoundedBoxBrush>(
                 Config.PanelShadowColor, PanelRadius);
 
-            ProgressBackgroundBrush = MakeShared<FSlateRoundedBoxBrush>(
-                Config.ProgressBarBackgroundColor, ProgressRadius);
 
-            ProgressFillBrush = MakeShared<FSlateRoundedBoxBrush>(
-                Config.ProgressBarFillColor, ProgressRadius);
         }
 
         TSharedRef<SWidget> BuildTitleWidget() const
@@ -776,13 +796,18 @@ namespace LoadingMonitor
         TSharedRef<SWidget> BuildPercentText(const FLoadingStateWeakPtr& WeakLoadingState) const
         {
             return SNew(STextBlock)
-                .MinDesiredWidth(40.0f)
+                .MinDesiredWidth(FMath::Max(40.0f, Config.PercentageFontSize * 3.5f))
                 .Justification(ETextJustify::Right)
                 .Text_Lambda([WeakLoadingState]() -> FText
                 {
                     const FLoadingStatePtr Pinned = WeakLoadingState.Pin();
-                    const float Percent = Pinned.IsValid() ? Pinned->GetPercent() : 0.0f;
-                    return FText::FromString(FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Percent)));
+                    if (!Pinned.IsValid() || !Pinned->HasProgress())
+                    {
+                        return FText::FromString(TEXT("\u2014"));
+                    }
+                    const float Percent = Pinned->GetPercent();
+                    const int32 WholePercent = Percent >= 100.0f ? 100 : FMath::Min(99, FMath::FloorToInt(Percent));
+                    return FText::FromString(FString::Printf(TEXT("%d%%"), WholePercent));
                 })
                 .Font(FCoreStyle::GetDefaultFontStyle(TEXT("Bold"), Config.PercentageFontSize))
                 .ColorAndOpacity(Config.PercentageTextColor);
@@ -790,25 +815,14 @@ namespace LoadingMonitor
 
         TSharedRef<SWidget> BuildProgressBar(const FLoadingStateWeakPtr& WeakLoadingState) const
         {
-            return SNew(SBox)
-                .HeightOverride(Config.ProgressBarHeight)
-                [
-                    SNew(SProgressBar)
-                    .BorderPadding(FVector2D::ZeroVector)
-                    .BackgroundImage(ProgressBackgroundBrush.Get())
-                    .FillImage(ProgressFillBrush.Get())
-                    .Percent_Lambda([WeakLoadingState]() -> TOptional<float>
-                    {
-                        // Always a real 0..1 value, never an unset TOptional - an unset Percent puts
-                        // SProgressBar into its built-in indeterminate "marquee" mode, which draws the
-                        // engine's default style/marquee brush instead of our configured fill color.
-                        // Starting at a real 0% and climbing looks like a loading bar; an animated
-                        // marquee in a color nothing else on screen matches does not.
-                        const FLoadingStatePtr Pinned = WeakLoadingState.Pin();
-                        const float Percent = Pinned.IsValid() ? Pinned->GetPercent() : 0.0f;
-                        return Percent / 100.0f;
-                    })
-                ];
+            return SNew(SLoadingProgressBar)
+                .LoadingState(WeakLoadingState)
+                .FillColor(Config.ProgressBarFillColor)
+                .TrackColor(Config.ProgressBarBackgroundColor)
+                .Height(Config.ProgressBarHeight)
+                .CornerRadius(Config.PanelLayoutMode == ELoadingPanelLayoutMode::FullWidthBottomBar
+                    ? 0.0f : Config.ProgressBarCornerRadius)
+                .AnimateActivity(Config.bAnimateProgressActivity);
         }
 
         /** The classic floating rounded card, bottom-left by default: throbber beside a progress row, status line beneath, inside one bordered/shadowed card. */
@@ -1240,8 +1254,6 @@ namespace LoadingMonitor
         FDisplayConfig Config;
         TSharedPtr<FSlateRoundedBoxBrush> PanelBrush;
         TSharedPtr<FSlateRoundedBoxBrush> PanelShadowBrush;
-        TSharedPtr<FSlateRoundedBoxBrush> ProgressBackgroundBrush;
-        TSharedPtr<FSlateRoundedBoxBrush> ProgressFillBrush;
         TArray<int32> ShuffledOrder;
         TArray<int32> MessageShuffledOrder;
         double StartTime = 0.0;
@@ -1348,6 +1360,9 @@ namespace LoadingMonitor
         Config.bShowProgressBar = Settings->bShowProgressBar;
         Config.bShowPercentageText = Settings->bShowPercentageText;
         Config.ProgressBarSmoothingSpeed = Settings->ProgressBarSmoothingSpeed;
+        Config.ProgressBarMaxSpeed = Settings->ProgressBarMaxSpeed;
+        Config.CompletionAnimationDurationSeconds = Settings->CompletionAnimationDurationSeconds;
+        Config.bAnimateProgressActivity = Settings->bAnimateProgressActivity;
         Config.AlmostThereThresholdPercent = FMath::Clamp(Settings->AlmostThereThresholdPercent, 1.0f, 100.0f);
         Config.ProgressBarFillColor = Settings->ProgressBarFillColor;
         Config.ProgressBarBackgroundColor = Settings->ProgressBarBackgroundColor;
@@ -1437,7 +1452,7 @@ namespace LoadingMonitor
 
             DemoState->SetMessageLabels(Config.MessageLabels);
             DemoState->SetMaxVisibleLines(Config.NumVisibleLogLines);
-            DemoState->SetSmoothingSpeed(Config.ProgressBarSmoothingSpeed);
+            DemoState->ConfigureProgress(Config.ProgressBarSmoothingSpeed, Config.ProgressBarMaxSpeed, Config.CompletionAnimationDurationSeconds);
             DemoState->SetAlmostThereThreshold(Config.AlmostThereThresholdPercent);
             DemoState->SetShowAssetDetail(Config.bShowDetailedAssetNames);
             DemoState->Reset(TEXT("PreviewMap"));
@@ -1535,57 +1550,34 @@ namespace LoadingMonitor
 
         bool Tick(float DeltaTime)
         {
-            if (!DemoState.IsValid())
+            if (!DemoState.IsValid()) return false;
+            DemoElapsed += DeltaTime;
+            if (DemoElapsed >= 15.0f)
             {
-                return false;
+                DemoElapsed = 0.0f;
+                DemoStep = 0;
+                DemoState->Reset(TEXT("PreviewMap"));
             }
 
-            // Steady completion, feeding the same cumulative completed-vs-total-ever-queued math the
-            // real progress bar uses - climbs continuously rather than sawtoothing back to 0.
-            const float JustCompleted = FMath::Min(DemoRemaining, DemoCompletionRate * DeltaTime);
-            DemoRemaining -= JustCompleted;
-
-            static const EStatusCategory DemoCycle[] =
+            struct FDemoEvent { float Time; int32 Remaining; int32 Completed; EStatusCategory Category; const TCHAR* Detail; };
+            // Unknown progress -> bursty batches -> newly discovered work -> a quiet pause -> finish.
+            static const FDemoEvent Events[] =
             {
-                EStatusCategory::CompilingShaders,
-                EStatusCategory::PreparingTextures,
-                EStatusCategory::PreparingStaticMeshes,
-                EStatusCategory::BuildingDistanceFields,
-                EStatusCategory::CompilingParticleSystems,
-                EStatusCategory::StreamingWorldData,
-                EStatusCategory::FetchingCachedData,
+                {1.2f, 100, 0, EStatusCategory::CompilingShaders, TEXT("M_Character_Master")},
+                {2.0f, 90, 10, EStatusCategory::PreparingTextures, TEXT("T_Character_Diffuse")},
+                {2.3f, 55, 35, EStatusCategory::PreparingStaticMeshes, TEXT("SM_Rock_01")},
+                {4.0f, 140, 5, EStatusCategory::BuildingDistanceFields, TEXT("SM_Castle_Wall")},
+                {5.5f, 80, 60, EStatusCategory::CompilingParticleSystems, TEXT("NS_Torch_Fire")},
+                {9.0f, 20, 60, EStatusCategory::StreamingWorldData, TEXT("World Partition Cell 12")},
+                {10.0f, 0, 20, EStatusCategory::FetchingCachedData, TEXT("DDC: Shader Bytecode")},
             };
-
-            // Matches DemoCycle index-for-index - lets the preview show what Detailed Asset Names
-            // actually looks like too, without a real compile to pull names from.
-            static const TCHAR* DemoDetail[] =
+            while (DemoStep < UE_ARRAY_COUNT(Events) && DemoElapsed >= Events[DemoStep].Time)
             {
-                TEXT("M_Character_Master"),
-                TEXT("T_Character_Diffuse"),
-                TEXT("SM_Rock_01"),
-                TEXT("SM_Castle_Wall"),
-                TEXT("NS_Torch_Fire"),
-                TEXT("World Partition Cell 12"),
-                TEXT("DDC: Shader Bytecode"),
-            };
-            static_assert(UE_ARRAY_COUNT(DemoDetail) == UE_ARRAY_COUNT(DemoCycle), "Keep these two arrays in sync.");
-
-            CategoryTimer += DeltaTime;
-            if (CategoryTimer >= 1.6f)
-            {
-                CategoryTimer = 0.0f;
-                CategoryIndex = (CategoryIndex + 1) % UE_ARRAY_COUNT(DemoCycle);
-                DemoState->PushCategory(DemoCycle[CategoryIndex], DemoDetail[CategoryIndex]);
-
-                // A new category starting simulates a new phase of work being discovered - a real,
-                // bounded dip in percentage (never a reset to 0%), same as a real multi-phase load
-                // (e.g. HLODs queuing up right as static meshes finish). Kept smaller than
-                // DemoCompletionRate on average so the overall trend still climbs toward 100%.
-                DemoRemaining += FMath::RandRange(15.0f, 45.0f);
+                const FDemoEvent& Event = Events[DemoStep++];
+                DemoState->PushCategory(Event.Category, Event.Detail);
+                DemoState->UpdateProgress(Event.Remaining, Event.Completed);
             }
-
-            DemoState->UpdateProgress(FMath::RoundToInt(DemoRemaining), FMath::RoundToInt(JustCompleted));
-
+            if (DemoElapsed >= 12.0f) DemoState->ForceComplete();
             return true;
         }
 
@@ -1594,10 +1586,8 @@ namespace LoadingMonitor
         FDisplayConfig Config;
         TWeakPtr<SWindow> WindowWeak;
         FTSTicker::FDelegateHandle TickerHandle;
-        static constexpr float DemoCompletionRate = 30.0f; // simulated items/sec
-        float DemoRemaining = 90.0f;
-        float CategoryTimer = 0.0f;
-        int32 CategoryIndex = 0;
+        float DemoElapsed = 0.0f;
+        int32 DemoStep = 0;
         TStrongObjectPtr<UUserWidget> PreviewCustomWidget;
 
         static TSharedPtr<FLoadingMonitorPreviewSession> GActiveSession;
@@ -1686,6 +1676,18 @@ public:
 
     virtual void ShutdownModule() override
     {
+        if (FSlateApplication::IsInitialized() && SlatePostTickHandle.IsValid())
+        {
+            FSlateApplication::Get().OnPostTick().Remove(SlatePostTickHandle);
+        }
+        if (IGameMoviePlayer* MoviePlayer = GetMoviePlayer())
+        {
+            MoviePlayer->OnMoviePlaybackStarted().Remove(PlaybackStartedHandle);
+            MoviePlayer->OnMoviePlaybackFinished().Remove(PlaybackFinishedHandle);
+            if (bOwnsLoadingScreen) MoviePlayer->StopMovie();
+        }
+        bOwnsLoadingScreen = false;
+
         if (PreLoadMapHandle.IsValid())
         {
             FCoreUObjectDelegates::PreLoadMap.Remove(PreLoadMapHandle);
@@ -1753,7 +1755,7 @@ private:
 
         State->SetMessageLabels(Config.MessageLabels);
         State->SetMaxVisibleLines(Config.NumVisibleLogLines);
-        State->SetSmoothingSpeed(Config.ProgressBarSmoothingSpeed);
+        State->ConfigureProgress(Config.ProgressBarSmoothingSpeed, Config.ProgressBarMaxSpeed, Config.CompletionAnimationDurationSeconds);
         State->SetAlmostThereThreshold(Config.AlmostThereThresholdPercent);
         State->SetShowAssetDetail(Config.bShowDetailedAssetNames);
         State->Reset(MapName);
@@ -1782,12 +1784,36 @@ private:
             return;
         }
 
+        // Slate post-tick also runs inside MoviePlayer's blocking wait, unlike the core ticker.
+        // StopMovie is only called on the game thread, after the visible finish has been painted.
+        if (!SlatePostTickHandle.IsValid())
+        {
+            SlatePostTickHandle = FSlateApplication::Get().OnPostTick().AddRaw(
+                this, &FLoadingMonitorModule::HandleSlatePostTick);
+        }
+        if (!PlaybackStartedHandle.IsValid())
+        {
+            PlaybackStartedHandle = MoviePlayer->OnMoviePlaybackStarted().AddRaw(
+                this, &FLoadingMonitorModule::HandlePlaybackStarted);
+            PlaybackFinishedHandle = MoviePlayer->OnMoviePlaybackFinished().AddRaw(
+                this, &FLoadingMonitorModule::HandlePlaybackFinished);
+        }
+        bOwnsLoadingScreen = true;
+        bPlaybackStarted = false;
+        ScreenStartedAt = FPlatformTime::Seconds();
+        CompletionStartedAt = PresentationFinishedAt = 0.0;
+        MinimumScreenTime = Settings ? FMath::Max(0.0f, Settings->MinimumDisplayTimeSeconds) : 0.0f;
+        CompletionHoldTime = Settings ? FMath::Clamp(Settings->CompletionHoldSeconds, 0.0f, 3.0f) : 0.15f;
+        CompletionTimeout = FMath::Clamp(Config.CompletionAnimationDurationSeconds, 0.0f, 3.0f) + 2.0f;
+
         FLoadingScreenAttributes Attributes;
-        Attributes.bAutoCompleteWhenLoadingCompletes = true;
+        Attributes.bAutoCompleteWhenLoadingCompletes = false;
         Attributes.bMoviesAreSkippable = false;
-        Attributes.bWaitForManualStop = false;
+        Attributes.bWaitForManualStop = true;
         Attributes.bAllowEngineTick = false;
-        Attributes.MinimumLoadingScreenDisplayTime = Settings != nullptr ? FMath::Max(0.0f, Settings->MinimumDisplayTimeSeconds) : 0.0f;
+        // Enforce total time ourselves. A negative engine minimum exposes IsLoadingFinished as
+        // soon as WaitForMovieToFinish starts, even if its PostLoadMap delegate runs before ours.
+        Attributes.MinimumLoadingScreenDisplayTime = -1.0f;
 
         Attributes.WidgetLoadingScreen = SNew(LoadingMonitor::SLoadingMonitorWidget)
             .LoadingState(State)
@@ -1847,17 +1873,61 @@ private:
 
     void HandlePostLoadMap(UWorld* LoadedWorld)
     {
+        if (bOwnsLoadingScreen) CompletionStartedAt = FPlatformTime::Seconds();
         if (State.IsValid())
         {
             State->PushCategory(LoadingMonitor::EStatusCategory::FinishingWorldSetup);
 
-            // The level is genuinely ready now - finish the bar to 100% (smoothed, not a snap) instead
-            // of leaving it wherever the last real asset-compiling sample happened to land. See
-            // ForceComplete()'s comment, and pair this with MinimumDisplayTimeSeconds so it's visible.
+            // Complete the bounded finish animation before the Slate post-tick dismisses our screen.
             State->ForceComplete();
         }
 
         RemoveCustomWidgetOverlay();
+    }
+
+    void HandlePlaybackStarted()
+    {
+        if (bOwnsLoadingScreen)
+        {
+            bPlaybackStarted = true;
+            ScreenStartedAt = FPlatformTime::Seconds();
+        }
+    }
+
+    void HandlePlaybackFinished()
+    {
+        bOwnsLoadingScreen = false;
+        bPlaybackStarted = false;
+        CompletionStartedAt = PresentationFinishedAt = 0.0;
+    }
+
+    void HandleSlatePostTick(float DeltaTime)
+    {
+        if (!IsInGameThread() || !bOwnsLoadingScreen || !bPlaybackStarted) return;
+        const double Now = FPlatformTime::Seconds();
+        IGameMoviePlayer* MoviePlayer = GetMoviePlayer();
+        // IsMovieCurrentlyPlaying() becomes false during the blocking wait in UE 5.8.
+        // Use our playback-start notification to distinguish a real wait from an idle player.
+        if (CompletionStartedAt <= 0.0 && MoviePlayer && MoviePlayer->IsLoadingFinished())
+        {
+            // Multicast delegate order is unspecified. Do not deadlock if MoviePlayer starts its
+            // blocking post-load wait before our PostLoadMap callback has had a chance to run.
+            CompletionStartedAt = Now;
+            if (State.IsValid()) State->ForceComplete();
+        }
+        if (CompletionStartedAt <= 0.0) return;
+        if (State.IsValid() && State->IsPresentationComplete() && PresentationFinishedAt <= 0.0)
+        {
+            PresentationFinishedAt = Now;
+        }
+        const bool bFinishVisible = PresentationFinishedAt > 0.0 && Now - PresentationFinishedAt >= CompletionHoldTime;
+        // Hidden/minimized widgets must never keep a ready map trapped behind a manual-stop screen.
+        const bool bPresentationTimedOut = Now - CompletionStartedAt >= CompletionTimeout + CompletionHoldTime;
+        if (Now - ScreenStartedAt >= MinimumScreenTime && (bFinishVisible || bPresentationTimedOut))
+        {
+            bOwnsLoadingScreen = false;
+            if (MoviePlayer) MoviePlayer->StopMovie();
+        }
     }
 
     /**
@@ -1885,6 +1955,17 @@ private:
     FDelegateHandle PreLoadMapHandle;
     FDelegateHandle PostLoadMapHandle;
     FDelegateHandle AssetCompileHandle;
+    FDelegateHandle SlatePostTickHandle;
+    FDelegateHandle PlaybackStartedHandle;
+    FDelegateHandle PlaybackFinishedHandle;
+    bool bOwnsLoadingScreen = false;
+    bool bPlaybackStarted = false;
+    double ScreenStartedAt = 0.0;
+    double CompletionStartedAt = 0.0;
+    double PresentationFinishedAt = 0.0;
+    float MinimumScreenTime = 0.0f;
+    float CompletionHoldTime = 0.15f;
+    float CompletionTimeout = 2.45f;
 };
 
 IMPLEMENT_MODULE(FLoadingMonitorModule, LoadingMonitor)

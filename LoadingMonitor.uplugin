@@ -5,7 +5,7 @@
   "FriendlyName": "Loading Monitor",
   "Description": "UE 5 loading monitor: thread-safe loading log capture with Slate/MoviePlayer overlay.",
   "Category": "Loading",
-  "CreatedBy": "OG Team",
+  "CreatedBy": "Umar Razzaq",
   "CanContainContent": false,
   "IsBetaVersion": true,
   "Installed": false,
